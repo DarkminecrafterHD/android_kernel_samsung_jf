@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -33,9 +33,11 @@ struct cpu_sync {
 	int cpu;
 	spinlock_t lock;
 	bool pending;
+	atomic_t being_woken;
 	int src_cpu;
 	unsigned int boost_min;
 	unsigned int input_boost_min;
+	unsigned int task_load;
 	unsigned int input_boost_freq;
 };
 
@@ -54,6 +56,12 @@ static bool input_boost_enabled;
 
 static unsigned int input_boost_ms = 40;
 module_param(input_boost_ms, uint, 0644);
+
+static unsigned int migration_load_threshold = 15;
+module_param(migration_load_threshold, uint, 0644);
+
+static bool load_based_syncs;
+module_param(load_based_syncs, bool, 0644);
 
 static struct delayed_work input_boost_rem;
 static u64 last_input_time;
@@ -223,6 +231,7 @@ static int boost_mig_sync_thread(void *data)
 	struct cpufreq_policy dest_policy;
 	struct cpufreq_policy src_policy;
 	unsigned long flags;
+	unsigned int req_freq;
 
 	while(1) {
 		wait_event_interruptible(s->sync_wq, s->pending ||
@@ -244,24 +253,22 @@ static int boost_mig_sync_thread(void *data)
 		if (ret)
 			continue;
 
-		if (dest_policy.cur >= src_policy.cur ) {
-			pr_debug("No sync. CPU%d@%dKHz >= CPU%d@%dKHz\n",
-				 dest_cpu, dest_policy.cur, src_cpu, src_policy.cur);
+		req_freq = load_based_syncs ?
+			(dest_policy.cpuinfo.max_freq * s->task_load) / 100 :
+							src_policy.cur;
+
+		if (req_freq <= dest_policy.cpuinfo.min_freq) {
+			pr_debug("No sync. Sync Freq:%u\n", req_freq);
 			continue;
 		}
 
-		if (sync_threshold && (dest_policy.cur >= sync_threshold))
-			continue;
+		if (sync_threshold)
+			req_freq = min(sync_threshold, req_freq);
 
 		cancel_delayed_work_sync(&s->boost_rem);
-		if (sync_threshold) {
-			if (src_policy.cur >= sync_threshold)
-				s->boost_min = sync_threshold;
-			else
-				s->boost_min = src_policy.cur;
-		} else {
-			s->boost_min = src_policy.cur;
-		}
+
+		s->boost_min = req_freq;
+
 		/* Force policy re-evaluation to trigger adjust notifier. */
 		get_online_cpus();
 		if (cpu_online(dest_cpu)) {
@@ -278,20 +285,46 @@ static int boost_mig_sync_thread(void *data)
 }
 
 static int boost_migration_notify(struct notifier_block *nb,
-				unsigned long dest_cpu, void *arg)
+				unsigned long unused, void *arg)
 {
+	struct migration_notify_data *mnd = arg;
 	unsigned long flags;
-	struct cpu_sync *s = &per_cpu(sync_info, dest_cpu);
+	struct cpu_sync *s = &per_cpu(sync_info, mnd->dest_cpu);
+
+	if (load_based_syncs && (mnd->load <= migration_load_threshold))
+		return NOTIFY_OK;
+
+	if (load_based_syncs && ((mnd->load < 0) || (mnd->load > 100))) {
+		pr_err("cpu-boost:Invalid load: %d\n", mnd->load);
+		return NOTIFY_OK;
+	}
+
+	if (!load_based_syncs && (mnd->src_cpu == mnd->dest_cpu))
+		return NOTIFY_OK;
 
 	if (!boost_ms)
 		return NOTIFY_OK;
 
-	pr_debug("Migration: CPU%d --> CPU%d\n", (int) arg, (int) dest_cpu);
+	/* Avoid deadlock in try_to_wake_up() */
+	if (s->thread == current)
+		return NOTIFY_OK;
+
+	pr_debug("Migration: CPU%d --> CPU%d\n", mnd->src_cpu, mnd->dest_cpu);
 	spin_lock_irqsave(&s->lock, flags);
 	s->pending = true;
-	s->src_cpu = (int) arg;
+	s->src_cpu = mnd->src_cpu;
+	s->task_load = load_based_syncs ? mnd->load : 0;
 	spin_unlock_irqrestore(&s->lock, flags);
-	wake_up(&s->sync_wq);
+	/*
+	* Avoid issuing recursive wakeup call, as sync thread itself could be
+	* seen as migrating triggering this notification. Note that sync thread
+	* of a cpu could be running for a short while with its affinity broken
+	* because of CPU hotplug.
+	*/
+	if (!atomic_cmpxchg(&s->being_woken, 0, 1)) {
+		wake_up(&s->sync_wq);
+		atomic_set(&s->being_woken, 0);
+	}
 
 	return NOTIFY_OK;
 }
@@ -427,6 +460,7 @@ static int cpu_boost_init(void)
 		s = &per_cpu(sync_info, cpu);
 		s->cpu = cpu;
 		init_waitqueue_head(&s->sync_wq);
+		atomic_set(&s->being_woken, 0);
 		spin_lock_init(&s->lock);
 		INIT_DELAYED_WORK(&s->boost_rem, do_boost_rem);
 		s->thread = kthread_run(boost_mig_sync_thread, (void *)cpu,
